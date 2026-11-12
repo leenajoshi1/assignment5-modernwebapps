@@ -1,0 +1,33 @@
+WRF Web App
+============
+
+Run 
+----
+1. python3 -m venv venv
+2. source venv/bin/activate
+3. For Google OAuth:
+   - pip3.7 install --only-binary :all: greenlet
+   - pip3.7 install --only-binary :all: pyopenssl
+   - pip3.7 install --only-binary :all: bcrypt
+3. pip3.7 install -r requirements.txt
+4. python3.7 application.py
+
+
+Try
+---
+1. Open application url: 
+   -http://localhost:5009/
+
+2. Add Admin user (this will work after adding POST REST API)
+   - curl -k https://localhost:5009/users -X POST -H "Content-Type: application/json" --data @admin.json
+
+3. Get users (this will work after adding GET REST API)
+   - curl -k https://localhost:5009/users
+
+4. From the application url, login as Admin1 user.
+
+Stop
+----
+1. Ctrl+C in the window where application.py was started
+
+
