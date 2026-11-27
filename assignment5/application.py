@@ -1,47 +1,32 @@
-from flask import Flask, redirect, request, url_for
-from flask import Response
-
-import requests
-import secrets
-
-import flask
-from flask import request
-from flask import Flask, render_template
-
-from jinja2 import Template
-
-from flask import session
-
-from werkzeug.utils import secure_filename
-
+import json
 import logging
 from logging.config import dictConfig
-
 import os
-import json
-
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
-from sqlalchemy.orm import declarative_base, relationship
-from sqlalchemy import Column, Integer, ForeignKey, String
+from pathlib import Path
+import secrets
 
 import bcrypt
-
-import google.oauth2.credentials
+from flask import Flask, Response, abort, redirect, render_template, request, session, url_for
+from google.auth.exceptions import GoogleAuthError
 import google_auth_oauthlib.flow
 import googleapiclient.discovery
+from googleapiclient.errors import HttpError
+from oauthlib.oauth2 import OAuth2Error
+from requests.exceptions import RequestException
+from sqlalchemy import Column, Integer, String, create_engine
+from sqlalchemy.dialects.sqlite import insert
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import declarative_base, sessionmaker
+from werkzeug.utils import secure_filename
 
 # This variable specifies the name of a file that contains the OAuth 2.0
 # information for this application, including its client_id and client_secret.
-CLIENT_SECRETS_FILE = "google_oauth_client_secret.json"
+CLIENT_SECRETS_FILE = Path(__file__).with_name("google_oauth_client_secret.json")
 
 
 
-# This OAuth 2.0 access scope allows for full read/write access to the
-# authenticated user's account and requires requests to use an SSL connection.
+# Request the Google account email address.
 SCOPES = ['https://www.googleapis.com/auth/userinfo.email']
-API_SERVICE_NAME = 'oauth2'
-API_VERSION = 'v2'
 os.environ['OAUTHLIB_RELAX_TOKEN_SCOPE'] = '1'
 
 
@@ -74,7 +59,8 @@ PHOTO_FOLDER = "static/images/photos"
 
 app = Flask(__name__)
 
-app.secret_key = secrets.token_hex()
+app.secret_key = os.getenv("PHOTO_PORTAL_SECRET_KEY") or secrets.token_hex()
+app.config.update(SESSION_COOKIE_SECURE=True, SESSION_COOKIE_SAMESITE="Lax")
 
 # Ref: https://stackoverflow.com/questions/14888799/disable-console-messages-in-flask-server
 log = logging.getLogger('werkzeug')
@@ -106,9 +92,16 @@ class PhotoData(Base):
         return {c.name: getattr(self, c.name) for c in self.__table__.columns}
 
 
-# Requirement 1: Add a User class to represent User table.
-# Table name should be 'user'
-# In the as_dict method, skip the password field/attribute when returning the dict.
+class User(Base):
+    __tablename__ = "user"
+
+    id = Column(Integer, primary_key=True)
+    name = Column(String, nullable=False, unique=True)
+    password = Column(String, nullable=False)
+    user_type = Column(String, nullable=False)
+
+    def as_dict(self):
+        return {"id": self.id, "name": self.name, "user_type": self.user_type}
 
 
 # Class that represents in-memory representation of a photo
@@ -142,59 +135,57 @@ def load_photos():
     return photos
 
 
-# https://stackoverflow.com/questions/19473250/how-to-get-user-email-after-oauth-with-google-api-python-client
 def get_user_info(credentials):
-    user_info_service = googleapiclient.discovery.build(API_SERVICE_NAME, API_VERSION, credentials=credentials)
-    user_info = None
-    try:
-        user_info = user_info_service.userinfo().get().execute()
-    except errors.HttpError as e:
-        logging.error('An error occurred: %s', e)
-    if user_info and user_info.get('id'):
-        return user_info
-    else:
-        raise Exception()
+    service = googleapiclient.discovery.build(
+        "oauth2", "v2", credentials=credentials, cache_discovery=False
+    )
+    return service.userinfo().get().execute()
 
 
-def credentials_to_dict(credentials):
-  return {'token': credentials.token,
-          'refresh_token': credentials.refresh_token,
-          'token_uri': credentials.token_uri,
-          'client_id': credentials.client_id,
-          'client_secret': credentials.client_secret,
-          'scopes': credentials.scopes}
+@app.before_request
+def check_photo_access():
+    role = session.get("user_type")
+    if request.endpoint in {"upload_photo", "update_tags", "delete_photos"}:
+        if role != "admin":
+            abort(403)
+    viewing_photo = request.endpoint in {"get_photos", "get_tags_for_photo", "search"}
+    if request.endpoint == "static":
+        viewing_photo = request.view_args["filename"].startswith("images/photos/")
+    if viewing_photo and role not in {"admin", "general"}:
+        abort(403)
 
 
-
-## Requirement 2.1: Add a POST REST API to add users
-## Requirement 2.1.1: Make sure that User with name does not exists in the DB
-## Requirement 2.2: Use bcrypt to hash the password.
-
-## POST /users REST API
-@app.route("/users", methods=['POST'])
+@app.route("/users", methods=["POST"])
 def add_user():
-    app.logger.info("Inside add_user")
-    data = request.json
-    app.logger.info("Received request:%s", str(data))
+    # Bootstrap on the server without opening admin registration to the public.
+    if request.remote_addr not in {"127.0.0.1", "::1"} and session.get("user_type") != "admin":
+        abort(403)
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict) or data.get("user_type") != "admin":
+        return Response("Expected an admin user.\n", status=400)
+    name = data.get("name")
+    password = data.get("password")
+    if not isinstance(name, str) or not name.strip() or not isinstance(password, str):
+        return Response("Name and password are required.\n", status=400)
+    name = name.strip()
+    password_bytes = password.encode("utf-8")
+    if not 1 <= len(password_bytes) <= 72:
+        return Response("Password must be 1 to 72 bytes.\n", status=400)
+    hashed = bcrypt.hashpw(password_bytes, bcrypt.gensalt()).decode("ascii")
+    with DBSession() as db:
+        db.add(User(name=name, password=hashed, user_type="admin"))
+        try:
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+            return Response(f"User with name {name} already exists.\n", status=400)
+    return {"name": name, "user_type": "admin"}
 
-    name = data['name']
-    password = data['password']
-    user_type = data["user_type"]
 
-    session = DBSession()
-    user = session.query(User).filter_by(name=name).first()
-    if user == None:
-        hashed = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt())
-        newuser = User(name=name, password=hashed, user_type=user_type)
-        session.add(newuser)
-        session.commit()
-        return newuser.as_dict()
-    else:
-        status = ("User with name {name} already exists.\n").format(name=name)
-        return Response(status, status=400)
-
-
-## Requirement 2.3: Add a GET REST API to get users
+@app.route("/users", methods=["GET"])
+def get_users():
+    with DBSession() as db:
+        return {"users": [user.as_dict() for user in db.query(User).order_by(User.id)]}
 
 
 # REST API to get photos - Sends photo names back
@@ -347,7 +338,7 @@ def search():
 	upload_form_display="display:block;"
 	slide_show_display="display:none;"
 	type_of_user = "admin"
-	if "@gmail.com" in username:
+	if session.get("user_type") == "general":
 		upload_form_display="display:none;"
 		slide_show_display="display:block;" 
 		type_of_user = "general"
@@ -366,8 +357,8 @@ def upload_photo():
 	app.logger.info("Inside upload_photo")
 
 	username = ""
-	if "username" in flask.session:
-		username = flask.session['username']
+	if "username" in session:
+		username = session['username']
 
 	date_taken = request.form["date_taken"].strip()
 	tags = request.form["tags"].strip()
@@ -378,10 +369,8 @@ def upload_photo():
 	app.logger.info("Date taken:" + date_taken)
 	app.logger.info("Tags:" + tags)
 
-	if not os.path.exists(PHOTO_FOLDER):
-		os.makedirs(PHOTO_FOLDER)
-
-	file.save(PHOTO_FOLDER + "/" + filename)
+	if not filename or Path(filename).suffix.lower() not in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".avif", ".tif", ".tiff"}:
+		abort(400, "Choose a supported image file.")
 
 	photo_data = PhotoData(name=filename, date_taken=date_taken, tags=tags)
 
@@ -389,8 +378,9 @@ def upload_photo():
     # Commit the photo only if photo with the name does not exist.
 	dbsession = DBSession()
 	photo_obj = dbsession.query(PhotoData).filter_by(name=filename).first()
-	if photo_obj == None:
-		app.logger.info("Found Photo:%s\n", str(photo_obj))
+	if photo_obj is None:
+		os.makedirs(PHOTO_FOLDER, exist_ok=True)
+		file.save(PHOTO_FOLDER + "/" + filename)
 		status = "Photo " + filename + " uploaded successfully."
 		dbsession.add(photo_data)
 		dbsession.commit()
@@ -409,147 +399,102 @@ def upload_photo():
                             user="admin")
 
 
-# Requirement 3.2
-# - Connect the "login_with_google" form with this method
-# - For http methods list in the definition, use POST and GET
+def oauth_flow(state=None):
+    flow = google_auth_oauthlib.flow.Flow.from_client_secrets_file(
+        CLIENT_SECRETS_FILE, scopes=SCOPES, state=state
+    )
+    flow.redirect_uri = os.getenv("PHOTO_PORTAL_OAUTH_REDIRECT_URI") or url_for(
+        "oauth2callback", _external=True
+    )
+    return flow
+
+
+@app.route("/login_with_google", methods=["GET", "POST"])
 def authorize():
     if not os.path.exists(CLIENT_SECRETS_FILE):
-        return render_template('google-oauth-client-secrets-file-missing.html')
-
-    # Create flow instance to manage the OAuth 2.0 Authorization Grant Flow steps.
-    flow = google_auth_oauthlib.flow.Flow.from_client_secrets_file(CLIENT_SECRETS_FILE, scopes=SCOPES)
-
-    # The URI created here must exactly match one of the authorized redirect URIs
-    # for the OAuth 2.0 client, which you configured in the API Console. If this
-    # value doesn't match an authorized URI, you will get a 'redirect_uri_mismatch'
-    # error.
-    redirect_uri = flask.url_for('oauth2callback', _external=True)
-    parts = redirect_uri.split("/oauth2callback")
-    print("Parts:" + str(parts))
-    if ":5009" not in redirect_uri:
-        flow.redirect_uri = parts[0] + ":5009/oauth2callback"
-    else:
-        flow.redirect_uri = redirect_uri
-    print("Redirect URI:" + flow.redirect_uri)
-
-    authorization_url, state = flow.authorization_url(
-        # Enable offline access so that you can refresh an access token without
-        # re-prompting the user for permission. Recommended for web server apps.
-        access_type='offline',
-        # Enable incremental authorization. Recommended as a best practice.
-        include_granted_scopes='true')
-
-    # Store the state so the callback can verify the auth server response.
-    flask.session['state'] = state
-    print("Authorization URL:" + authorization_url)
-
-    return flask.redirect(authorization_url)
+        return render_template("google-oauth-client-secrets-file-missing.html"), 503
+    flow = oauth_flow()
+    authorization_url, state = flow.authorization_url()
+    session["oauth_state"] = state
+    session["oauth_code_verifier"] = flow.code_verifier
+    return redirect(authorization_url)
 
 
-@app.route('/oauth2callback')
+@app.route("/oauth2callback")
 def oauth2callback():
-    # Specify the state when creating the flow in the callback so that it can
-    # verified in the authorization server response.
-    state = flask.session['state']
+    state = session.pop("oauth_state", None)
+    code_verifier = session.pop("oauth_code_verifier", None)
+    if not state or not secrets.compare_digest(
+        state.encode("utf-8"), request.args.get("state", "").encode("utf-8")
+    ):
+        return render_template("index.html", error="Google sign-in session expired. Please try again."), 400
+    if request.args.get("error") or not request.args.get("code"):
+        return render_template("index.html", error="Google sign-in was not completed."), 400
 
-    flow = google_auth_oauthlib.flow.Flow.from_client_secrets_file(CLIENT_SECRETS_FILE, scopes=SCOPES, state=state)
-    flow.redirect_uri = flask.url_for('oauth2callback', _external=True)
+    try:
+        flow = oauth_flow(state)
+        flow.code_verifier = code_verifier
+        flow.fetch_token(code=request.args["code"])
+        profile = get_user_info(flow.credentials)
+    except (OAuth2Error, RequestException, GoogleAuthError, HttpError, OSError, ValueError):
+        return render_template("index.html", error="Google sign-in failed. Please try again."), 502
 
-    # Use the authorization server's response to fetch the OAuth 2.0 tokens.
-    authorization_response = flask.request.url
-    print("Authorization response:" + authorization_response)
-    flow.fetch_token(authorization_response=authorization_response)
+    email = profile.get("email")
+    if not email or not profile.get("verified_email"):
+        return render_template("index.html", error="Google did not provide a verified email."), 403
+    email = email.strip().lower()
 
-    # Store credentials in the session.
-    # In a production app, you likely want to save these
-    # credentials in a persistent database instead.
-    credentials = flow.credentials
-    flask.session['credentials'] = credentials_to_dict(credentials)
+    with DBSession() as db:
+        db.execute(
+            insert(User).values(name=email, password="", user_type="general")
+            .on_conflict_do_nothing(index_elements=["name"])
+        )
+        user = db.query(User).filter_by(name=email).one()
+        if user.user_type != "general":
+            return render_template("index.html", error="That email is already registered as an admin."), 409
+        db.commit()
 
-    return flask.redirect(flask.url_for('login'))
+    session.clear()
+    session.update(username=email, user_type="general")
+    return redirect(url_for("login"))
 
 
-@app.route("/logout",methods=['POST'])
+@app.route("/logout", methods=["POST"])
 def logout():
-    app.logger.info("Logout called.")
-    app.logger.info("Before returning...")
-    user = flask.session["username"]
-    flask.session.pop('username', None)
-
-    # delete credentials from Flask session
-    if 'credentials' in flask.session:
-        credentials = google.oauth2.credentials.Credentials(**flask.session['credentials'])
-
-        revoke = requests.post('https://oauth2.googleapis.com/revoke',
-                params={'token': credentials.token},
-                headers = {'content-type': 'application/x-www-form-urlencoded'})
-
-        status_code = getattr(revoke, 'status_code')
-        if status_code == 200:
-            print("Credentials successfully revoked.")
-        del flask.session['credentials']
-
-    if "@gmail.com" in user:
-    	return flask.redirect("/")
-    else:
-        return flask.redirect("/admin")
+    role = session.get("user_type")
+    session.clear()
+    return redirect(url_for("adminindex" if role == "admin" else "index"))
 
 
-@app.route("/login", methods=['POST','GET'])
+@app.route("/login", methods=["POST", "GET"])
 def login():
-    username = ""
-    password = ""
-    gmail = ""
-    user = ""
-    upload_form_display = ""
-    status = ""
+    if request.method == "POST":
+        username = request.form.get("username", "").strip()
+        password = request.form.get("password", "").encode("utf-8")
+        with DBSession() as db:
+            user = db.query(User).filter_by(name=username, user_type="admin").first()
+            if user is None:
+                return render_template("adminindex.html", error=f"{username} not found"), 404
+            stored_hash = user.password
+        if isinstance(stored_hash, str):
+            stored_hash = stored_hash.encode("ascii")
+        if len(password) > 72 or not bcrypt.checkpw(password, stored_hash):
+            return render_template("adminindex.html", error="password does not match"), 400
+        session.clear()
+        session.update(username=username, user_type="admin")
+        return redirect(url_for("login"))
 
-    photos = load_photos()
-
-    if 'username' in request.form:
-        type_of_user = "admin"
-        username = request.form['username'].strip()
-        password = request.form['password'].strip()
-        user = username
-        app.logger.info("Username:%s", username)
-        app.logger.info("Password:%s", password)
-        upload_form_display = "display:block;"
-        slide_show_display = "display:block;"
-
-        # Requirement 2.4
-        # Requirement 2.5
-
-        
-    # Load credentials from the session.
-    if 'credentials' in flask.session:
-        type_of_user = "general"
-        credentials = google.oauth2.credentials.Credentials(**flask.session['credentials'])
-
-        user_email = get_user_info(credentials)['email']
-        print("User email:" + user_email)
-        user = user_email
-
-        # Requirement 3.3
-        # - Insert User in the DB
-        # - Leave password empty
-
-
-        flask.session['credentials'] = credentials_to_dict(credentials)
-        upload_form_display = "display:none;"
-        slide_show_display = "display:block;"
-
-    app.logger.info("User photos:")
-    app.logger.info(photos)
-    app.logger.info("---")
-
-    flask.session["username"] = user
-
-    return render_template('photo-portal.html',
-    						upload_form_display=upload_form_display,
-    						username=user,
-    						slide_show_display=slide_show_display,
-    						photo_list=photos,
-                            user=type_of_user)
+    user_type = session.get("user_type")
+    if user_type not in {"admin", "general"}:
+        return redirect(url_for("index"))
+    return render_template(
+        "photo-portal.html",
+        username=session["username"],
+        upload_form_display="display:block;" if user_type == "admin" else "display:none;",
+        slide_show_display="display:block;",
+        photo_list=load_photos(),
+        user=user_type,
+    )
 
 
 @app.route("/admin")
