@@ -1,16 +1,19 @@
 # Assignment 5 Reflection
 
+Leena Joshi
 
-The trickiest requirement was making the Google callback create exactly one general user record while keeping the account separate from the admin login. The starter code already exchanged the authorization code for Google credentials, but I needed a clear point to create the local account and assign the session role. I put that logic in the callback, after the state check and after Google provides a verified email. The callback stores the email in the user table with an empty password. A database uniqueness constraint prevents repeated or concurrent sign-ins from creating duplicate records. After the database step succeeds, Flask stores the email and role in the session and redirects to the portal.
+The trickiest requirement was making the Google callback create exactly one general user record per email. The starter code already exchanged the authorization code for Google credentials, so I added the database step after the callback checks the OAuth state and receives a verified email. The callback records the email with an empty password and sets the account type to `general`. A uniqueness constraint prevents duplicate accounts when someone signs in again or when two callbacks arrive close together. Once the database step succeeds, Flask stores the email and role in the session and redirects to the photo portal.
 
-I used the session role for access decisions throughout the photo portal. In particular, I changed the search and logout paths to read the role from the session. I also checked the role on the server for upload, tag updates, and deletion, since someone can make a POST request without using the form. The admin registration route hashes the password with bcrypt, and the account listing returns only the fields specified in the assignment.
+I used the session role to determine which controls the portal displays and which requests the server accepts. Search and logout read the stored role, and Flask checks for the admin role before accepting upload, tag update, or delete requests. The admin registration endpoint hashes passwords with bcrypt, and `GET /users` returns account details without passwords.
 
-For local testing, I ran the Flask app on port 5009 with its self-signed HTTPS certificate. I created an admin account, checked the stored bcrypt hash, and tried registering the same name twice. I submitted an unknown username and an incorrect password to verify the two different error messages. After a successful sign-in, I exercised photo upload, tag search, tag updates, deletion, and logout. I also tested the OAuth callback with a mocked Google response. Two sign-ins with the same verified email produced one general user, and a request to upload as that user returned HTTP 403. Live Google sign-in and the public EC2 URL still need verification.
+I ran the app locally on Windows over HTTPS on port 5009, registered `Admin1` through `POST /users`, and confirmed that an incorrect password displayed the expected error. With the correct password, I reached the admin portal and saw the upload and photo management controls. Separate automated checks verified the stored bcrypt hash, duplicate admin rejection, and both admin login errors. A mocked Google callback also confirmed that two sign-ins with the same verified email produced one user record and that a general user received HTTP 403 when attempting an upload.
+
+On EC2, Google initially returned `redirect_uri_mismatch`. I checked the callback URL in the error details and compared the OAuth client ID on the server with the client in Google Cloud. After saving the exact EC2 callback URL on that client, I successfully signed in with Google from the deployed portal.
 
 ![Admin password error](screenshots/01-invalid-admin-password.png)
 
-*Requirement 2.5. The admin sign-in page displays “password does not match” when the username exists and the supplied password is incorrect.*
+*Requirement 2.5. The admin sign-in page displays “password does not match” when an existing admin enters an incorrect password.*
 
 ![Admin photo portal after sign-in](screenshots/02-admin-photo-portal.png)
 
-*Requirement 4. A successful admin sign-in opens the photo portal with the upload form and the existing photo controls.*
+*Requirement 4. A successful admin sign-in opens the portal with the upload form and photo management controls.*
